@@ -226,20 +226,26 @@ UP013 [*] Convert `X` from `TypedDict` functional to class syntax
    |
 45 |   # Unsafe fix if comments are present
 46 | / X = TypedDict("X", {
-47 | |     "some_config": int,  # important
-48 | | })
+47 | |     # important
+48 | |     "some_config": int,  # important
+49 | |     # important
+50 | |     "other_config": int, # important
+51 | |     # important
+52 | | })
    | |__^
-49 |
-50 |   # Private names should not be reported (OK)
-   |
 help: Convert `X` to class syntax
    |
 45 | # Unsafe fix if comments are present
    - X = TypedDict("X", {
-   -     "some_config": int,  # important
-   - })
 46 + class X(TypedDict):
-47 +     some_config: int
-48 |
+47 |     # important
+   -     "some_config": int,  # important
+48 +     some_config: int # important
+49 |     # important
+   -     "other_config": int, # important
+50 +     other_config: int # important
+51 |     # important
+   - })
+52 |
    |
 note: This is an unsafe fix and may change runtime behavior

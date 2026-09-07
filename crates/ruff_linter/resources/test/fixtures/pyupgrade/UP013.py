@@ -44,8 +44,13 @@ MyType = TypedDict("MyType", dict())
 
 # Unsafe fix if comments are present
 X = TypedDict("X", {
+    # important
     "some_config": int,  # important
+    # important
+    "other_config": int, # important
+    # important
 })
+
 
 # Private names should not be reported (OK)
 WithPrivate = TypedDict("WithPrivate", {"__x": int})

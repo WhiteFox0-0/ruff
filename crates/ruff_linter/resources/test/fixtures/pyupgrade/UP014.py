@@ -34,6 +34,10 @@ S3File = NamedTuple(
 
 # Unsafe fix if comments are present
 X = NamedTuple("X", [
+    # important
     ("some_config", int),  # important
+    # important
+    ("other_config", int), # important
+    # important
 ])
 

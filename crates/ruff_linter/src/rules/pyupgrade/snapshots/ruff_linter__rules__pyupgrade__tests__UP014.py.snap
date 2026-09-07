@@ -99,17 +99,26 @@ UP014 [*] Convert `X` from `NamedTuple` functional to class syntax
    |
 35 |   # Unsafe fix if comments are present
 36 | / X = NamedTuple("X", [
-37 | |     ("some_config", int),  # important
-38 | | ])
+37 | |     # important
+38 | |     ("some_config", int),  # important
+39 | |     # important
+40 | |     ("other_config", int), # important
+41 | |     # important
+42 | | ])
    | |__^
 help: Convert `X` to class syntax
    |
 35 | # Unsafe fix if comments are present
    - X = NamedTuple("X", [
-   -     ("some_config", int),  # important
-   - ])
 36 + class X(NamedTuple):
-37 +     some_config: int
-38 |
+37 |     # important
+   -     ("some_config", int),  # important
+38 +     some_config: int # important
+39 |     # important
+   -     ("other_config", int), # important
+40 +     other_config: int # important
+41 |     # important
+   - ])
+42 |
    |
 note: This is an unsafe fix and may change runtime behavior

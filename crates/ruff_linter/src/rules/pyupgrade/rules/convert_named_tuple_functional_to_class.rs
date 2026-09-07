@@ -87,16 +87,24 @@ pub(crate) fn convert_named_tuple_functional_to_class(
         return;
     };
 
-    let fields = match (args, keywords) {
+    let (fields, list_items) = match (args, keywords) {
         // Ex) `NamedTuple("MyType")`
-        ([_typename], []) => Suite::from([Stmt::Pass(ast::StmtPass {
-            range: TextRange::default(),
-            node_index: ruff_python_ast::AtomicNodeIndex::NONE,
-        })]),
+        ([_typename], []) => (
+            Suite::from([Stmt::Pass(ast::StmtPass {
+                range: TextRange::default(),
+                node_index: ruff_python_ast::AtomicNodeIndex::NONE,
+            })]),
+            None,
+        ),
         // Ex) `NamedTuple("MyType", [("a", int), ("b", str)])`
-        ([_typename, fields], []) => {
-            if let Some(fields) = create_fields_from_fields_arg(fields) {
-                fields
+        ([_typename, fields_arg], []) => {
+            if let Some(list_expr) = fields_arg.as_list_expr() {
+                if let Some(fields) = create_fields_from_fields_arg(fields_arg) {
+                    (fields, Some(list_expr))
+                } else {
+                    debug!("Skipping `NamedTuple` \"{typename}\": unable to parse fields");
+                    return;
+                }
             } else {
                 debug!("Skipping `NamedTuple` \"{typename}\": unable to parse fields");
                 return;
@@ -105,7 +113,7 @@ pub(crate) fn convert_named_tuple_functional_to_class(
         // Ex) `NamedTuple("MyType", a=int, b=str)`
         ([_typename], keywords) => {
             if let Some(fields) = create_fields_from_keywords(keywords) {
-                fields
+                (fields, None)
             } else {
                 debug!("Skipping `NamedTuple` \"{typename}\": unable to parse keywords");
                 return;
@@ -126,14 +134,16 @@ pub(crate) fn convert_named_tuple_functional_to_class(
     );
     // TODO(charlie): Preserve indentation, to remove the first-column requirement.
     if checker.locator().is_at_start_of_line(stmt.start()) {
-        diagnostic.set_fix(convert_to_class(
+        diagnostic.set_fix(convert_to_class(FixParams {
             stmt,
             typename,
-            fields,
+            body: fields,
             base_class,
-            checker.generator(),
-            checker.comment_ranges(),
-        ));
+            generator: checker.generator(),
+            comment_ranges: checker.comment_ranges(),
+            source: checker.locator().contents(),
+            list_items,
+        }));
     }
 }
 
@@ -251,24 +261,127 @@ fn create_class_def_stmt(typename: &str, body: Suite, base_class: &Expr) -> Stmt
     .into()
 }
 
-/// Generate a `Fix` to convert a `NamedTuple` assignment to a class definition.
-fn convert_to_class(
-    stmt: &Stmt,
-    typename: &str,
+struct FixParams<'a> {
+    stmt: &'a Stmt,
+    typename: &'a str,
     body: Suite,
-    base_class: &Expr,
-    generator: Generator,
-    comment_ranges: &CommentRanges,
-) -> Fix {
+    base_class: &'a Expr,
+    generator: Generator<'a>,
+    comment_ranges: &'a CommentRanges,
+    source: &'a str,
+    list_items: Option<&'a ast::ExprList>,
+}
+
+/// Generate a `Fix` to convert a `NamedTuple` assignment to a class definition.
+fn convert_to_class(params: FixParams<'_>) -> Fix {
+    let applicability = if params.comment_ranges.intersects(params.stmt.range()) {
+        Applicability::Unsafe
+    } else {
+        Applicability::Safe
+    };
+
+    let mut output = params.generator.stmt(&create_class_def_stmt(
+        params.typename,
+        params.body,
+        params.base_class,
+    ));
+
+    // Extract and append comments if we have list items
+    if let Some(list_expr) = params.list_items {
+        let items = &list_expr.elts;
+        if !items.is_empty() {
+            let all_comments = params.comment_ranges.comments_in_range(list_expr.range());
+            if !all_comments.is_empty() {
+                // Build per-field comments
+                let mut trailing: Vec<Option<&str>> = items.iter().map(|_| None).collect();
+                let mut leading: Vec<Vec<&str>> = items.iter().map(|_| Vec::new()).collect();
+                let mut trailing_own_line: Vec<Vec<&str>> =
+                    items.iter().map(|_| Vec::new()).collect();
+
+                for comment_range in all_comments {
+                    let start = comment_range.start();
+                    let line_start = params.source.line_start(start);
+                    let text = &params.source[*comment_range];
+
+                    // Trailing: same line as a field's end
+                    let mut found = false;
+                    for (i, item) in items.iter().enumerate() {
+                        if line_start <= item.end() && start >= item.end() {
+                            if trailing[i].is_none() {
+                                trailing[i] = Some(text);
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if !found {
+                        // Leading: before some field's start
+                        let mut assigned = false;
+                        for (i, item) in items.iter().enumerate() {
+                            if start < item.start() {
+                                leading[i].push(text);
+                                assigned = true;
+                                break;
+                            }
+                        }
+                        // Trailing own-line: after last field
+                        if !assigned {
+                            let last = items.len() - 1;
+                            if start > items[last].end() {
+                                trailing_own_line[last].push(text);
+                            }
+                        }
+                    }
+                }
+
+                // Apply comments to output
+                let lines: Vec<String> = output.lines().map(String::from).collect();
+                let mut new_lines = Vec::with_capacity(lines.len());
+                let mut field_idx = 0;
+
+                for line in &lines {
+                    let trimmed = line.trim();
+                    if trimmed.contains(": ")
+                        && !trimmed.starts_with("class ")
+                        && !trimmed.starts_with("pass")
+                    {
+                        if field_idx < items.len() {
+                            let indent = line.len() - line.trim_start().len();
+                            let indent_str = " ".repeat(indent);
+
+                            for c in &leading[field_idx] {
+                                new_lines.push(format!("{indent_str}{c}"));
+                            }
+
+                            new_lines.push(line.clone());
+
+                            if let Some(c) = trailing[field_idx] {
+                                let last = new_lines.last_mut().unwrap();
+                                if !last.ends_with(' ') {
+                                    last.push(' ');
+                                }
+                                last.push_str(c);
+                            }
+
+                            for c in &trailing_own_line[field_idx] {
+                                new_lines.push(format!("{indent_str}{c}"));
+                            }
+
+                            field_idx += 1;
+                        }
+                    } else {
+                        new_lines.push(line.clone());
+                    }
+                }
+
+                output = new_lines.join("\n");
+            }
+        }
+    }
+
     Fix::applicable_edit(
-        Edit::range_replacement(
-            generator.stmt(&create_class_def_stmt(typename, body, base_class)),
-            stmt.range(),
-        ),
-        if comment_ranges.intersects(stmt.range()) {
-            Applicability::Unsafe
-        } else {
-            Applicability::Safe
-        },
+        Edit::range_replacement(output, params.stmt.range()),
+        applicability,
     )
 }
