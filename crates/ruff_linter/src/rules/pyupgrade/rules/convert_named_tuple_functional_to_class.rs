@@ -11,7 +11,7 @@ use ruff_python_semantic::SemanticModel;
 use ruff_python_stdlib::identifiers::is_identifier;
 use ruff_python_trivia::CommentRanges;
 use ruff_source_file::LineRanges;
-use ruff_text_size::{Ranged, TextRange};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::checkers::ast::Checker;
 use crate::codes::Category;
@@ -286,97 +286,15 @@ fn convert_to_class(params: FixParams<'_>) -> Fix {
         params.base_class,
     ));
 
-    // Extract and append comments if we have list items
-    if let Some(list_expr) = params.list_items {
-        let items = &list_expr.elts;
-        if !items.is_empty() {
-            let all_comments = params.comment_ranges.comments_in_range(list_expr.range());
-            if !all_comments.is_empty() {
-                // Build per-field comments
-                let mut trailing: Vec<Option<&str>> = items.iter().map(|_| None).collect();
-                let mut leading: Vec<Vec<&str>> = items.iter().map(|_| Vec::new()).collect();
-                let mut trailing_own_line: Vec<Vec<&str>> =
-                    items.iter().map(|_| Vec::new()).collect();
-
-                for comment_range in all_comments {
-                    let start = comment_range.start();
-                    let line_start = params.source.line_start(start);
-                    let text = &params.source[*comment_range];
-
-                    // Trailing: same line as a field's end
-                    let mut found = false;
-                    for (i, item) in items.iter().enumerate() {
-                        if line_start <= item.end() && start >= item.end() {
-                            if trailing[i].is_none() {
-                                trailing[i] = Some(text);
-                            }
-                            found = true;
-                            break;
-                        }
-                    }
-
-                    if !found {
-                        // Leading: before some field's start
-                        let mut assigned = false;
-                        for (i, item) in items.iter().enumerate() {
-                            if start < item.start() {
-                                leading[i].push(text);
-                                assigned = true;
-                                break;
-                            }
-                        }
-                        // Trailing own-line: after last field
-                        if !assigned {
-                            let last = items.len() - 1;
-                            if start > items[last].end() {
-                                trailing_own_line[last].push(text);
-                            }
-                        }
-                    }
-                }
-
-                // Apply comments to output
-                let lines: Vec<String> = output.lines().map(String::from).collect();
-                let mut new_lines = Vec::with_capacity(lines.len());
-                let mut field_idx = 0;
-
-                for line in &lines {
-                    let trimmed = line.trim();
-                    if trimmed.contains(": ")
-                        && !trimmed.starts_with("class ")
-                        && !trimmed.starts_with("pass")
-                    {
-                        if field_idx < items.len() {
-                            let indent = line.len() - line.trim_start().len();
-                            let indent_str = " ".repeat(indent);
-
-                            for c in &leading[field_idx] {
-                                new_lines.push(format!("{indent_str}{c}"));
-                            }
-
-                            new_lines.push(line.clone());
-
-                            if let Some(c) = trailing[field_idx] {
-                                let last = new_lines.last_mut().unwrap();
-                                if !last.ends_with(' ') {
-                                    last.push(' ');
-                                }
-                                last.push_str(c);
-                            }
-
-                            for c in &trailing_own_line[field_idx] {
-                                new_lines.push(format!("{indent_str}{c}"));
-                            }
-
-                            field_idx += 1;
-                        }
-                    } else {
-                        new_lines.push(line.clone());
-                    }
-                }
-
-                output = new_lines.join("\n");
-            }
+    if let Some(list_expr) = params.list_items.filter(|l| !l.elts.is_empty()) {
+        let all_comments = params.comment_ranges.comments_in_range(list_expr.range());
+        if !all_comments.is_empty() {
+            let item_ranges: Vec<_> = list_expr
+                .elts
+                .iter()
+                .map(|item| (item.start(), item.end()))
+                .collect();
+            output = reattach_comments(&output, &item_ranges, all_comments, params.source);
         }
     }
 
@@ -384,4 +302,66 @@ fn convert_to_class(params: FixParams<'_>) -> Fix {
         Edit::range_replacement(output, params.stmt.range()),
         applicability,
     )
+}
+
+/// Reinsert comments from an original list literal into a generated class body,
+/// attaching each comment to the field it was originally adjacent to.
+fn reattach_comments(
+    output: &str,
+    item_ranges: &[(TextSize, TextSize)],
+    all_comments: &[TextRange],
+    source: &str,
+) -> String {
+    let mut trailing: Vec<Option<&str>> = vec![None; item_ranges.len()];
+    let mut leading: Vec<Vec<&str>> = vec![Vec::new(); item_ranges.len()];
+    let mut trailing_own_line: Vec<Vec<&str>> = vec![Vec::new(); item_ranges.len()];
+
+    for comment_range in all_comments {
+        let start = comment_range.start();
+        let line_start = source.line_start(start);
+        let text = &source[*comment_range];
+
+        if let Some(i) = item_ranges
+            .iter()
+            .position(|&(_, end)| line_start <= end && start >= end)
+        {
+            trailing[i].get_or_insert(text);
+        } else if let Some(i) = item_ranges.iter().position(|&(s, _)| start < s) {
+            leading[i].push(text);
+        } else if start > item_ranges[item_ranges.len() - 1].1 {
+            trailing_own_line[item_ranges.len() - 1].push(text);
+        }
+    }
+
+    let mut lines = output.lines();
+    let header = lines.next().unwrap_or_default().to_string();
+    let mut new_lines = Vec::with_capacity(item_ranges.len() * 2 + 1);
+    new_lines.push(header);
+
+    for (field_idx, line) in lines.enumerate() {
+        let indent_str = " ".repeat(line.len() - line.trim_start().len());
+
+        new_lines.extend(
+            leading[field_idx]
+                .iter()
+                .map(|c| format!("{indent_str}{c}")),
+        );
+
+        let mut line = line.to_string();
+        if let Some(c) = trailing[field_idx] {
+            if !line.ends_with(' ') {
+                line.push(' ');
+            }
+            line.push_str(c);
+        }
+        new_lines.push(line);
+
+        new_lines.extend(
+            trailing_own_line[field_idx]
+                .iter()
+                .map(|c| format!("{indent_str}{c}")),
+        );
+    }
+
+    new_lines.join("\n")
 }
