@@ -97,7 +97,12 @@ pub(crate) fn convert_typed_dict_functional_to_class(
         return;
     };
 
-    let Some((body, total_keyword)) = match_fields_and_total(arguments) else {
+    let Some(TypedDictFields {
+        body,
+        total_keyword,
+        dict_items,
+    }) = match_fields_and_total(arguments)
+    else {
         return;
     };
 
@@ -109,15 +114,17 @@ pub(crate) fn convert_typed_dict_functional_to_class(
     );
     // TODO(charlie): Preserve indentation, to remove the first-column requirement.
     if checker.locator().is_at_start_of_line(stmt.start()) {
-        diagnostic.set_fix(convert_to_class(
+        diagnostic.set_fix(convert_to_class(FixParams {
             stmt,
             class_name,
             body,
             total_keyword,
             base_class,
-            checker.generator(),
-            checker.comment_ranges(),
-        ));
+            generator: checker.generator(),
+            comment_ranges: checker.comment_ranges(),
+            source: checker.locator().contents(),
+            dict_items,
+        }));
     }
 }
 
@@ -261,8 +268,14 @@ fn fields_from_keywords(keywords: &[Keyword]) -> Option<Suite> {
         .collect()
 }
 
+struct TypedDictFields<'a> {
+    body: Suite,
+    total_keyword: Option<&'a Keyword>,
+    dict_items: Option<(&'a [ast::DictItem], TextRange)>,
+}
+
 /// Match the fields and `total` keyword from a `TypedDict` call.
-fn match_fields_and_total(arguments: &Arguments) -> Option<(Suite, Option<&Keyword>)> {
+fn match_fields_and_total(arguments: &Arguments) -> Option<TypedDictFields<'_>> {
     match (&*arguments.args, &*arguments.keywords) {
         // Ex) `TypedDict("MyType", {"a": int, "b": str})`
         ([_typename, fields], [..]) => {
@@ -270,15 +283,23 @@ fn match_fields_and_total(arguments: &Arguments) -> Option<(Suite, Option<&Keywo
             match fields {
                 Expr::Dict(ast::ExprDict {
                     items,
-                    range: _,
+                    range,
                     node_index: _,
-                }) => Some((fields_from_dict_literal(items)?, total)),
+                }) => Some(TypedDictFields {
+                    body: fields_from_dict_literal(items)?,
+                    total_keyword: total,
+                    dict_items: Some((items, *range)),
+                }),
                 Expr::Call(ast::ExprCall {
                     func,
                     arguments: Arguments { keywords, .. },
                     range_start: _,
                     node_index: _,
-                }) => Some((fields_from_dict_call(func, keywords)?, total)),
+                }) => Some(TypedDictFields {
+                    body: fields_from_dict_call(func, keywords)?,
+                    total_keyword: total,
+                    dict_items: None,
+                }),
                 _ => None,
             }
         }
@@ -288,39 +309,145 @@ fn match_fields_and_total(arguments: &Arguments) -> Option<(Suite, Option<&Keywo
                 range: TextRange::default(),
                 node_index: ruff_python_ast::AtomicNodeIndex::NONE,
             });
-            Some((Suite::from([node]), None))
+            Some(TypedDictFields {
+                body: Suite::from([node]),
+                total_keyword: None,
+                dict_items: None,
+            })
         }
         // Ex) `TypedDict("MyType", a=int, b=str)`
-        ([_typename], fields) => Some((fields_from_keywords(fields)?, None)),
+        ([_typename], fields) => Some(TypedDictFields {
+            body: fields_from_keywords(fields)?,
+            total_keyword: None,
+            dict_items: None,
+        }),
         // Ex) `TypedDict()`
         _ => None,
     }
 }
 
-/// Generate a `Fix` to convert a `TypedDict` from functional to class.
-fn convert_to_class(
-    stmt: &Stmt,
-    class_name: &str,
+struct FixParams<'a> {
+    stmt: &'a Stmt,
+    class_name: &'a str,
     body: Suite,
-    total_keyword: Option<&Keyword>,
-    base_class: &Expr,
-    generator: Generator,
-    comment_ranges: &CommentRanges,
-) -> Fix {
+    total_keyword: Option<&'a Keyword>,
+    base_class: &'a Expr,
+    generator: Generator<'a>,
+    comment_ranges: &'a CommentRanges,
+    source: &'a str,
+    dict_items: Option<(&'a [ast::DictItem], TextRange)>,
+}
+
+/// Generate a `Fix` to convert a `TypedDict` from functional to class.
+fn convert_to_class(params: FixParams<'_>) -> Fix {
+    let applicability = if params.comment_ranges.intersects(params.stmt.range()) {
+        Applicability::Unsafe
+    } else {
+        Applicability::Safe
+    };
+
+    let mut output = params.generator.stmt(&create_class_def_stmt(
+        params.class_name,
+        params.body,
+        params.total_keyword,
+        params.base_class,
+    ));
+
+    // Extract and append comments if we have dict items
+    if let Some((items, dict_range)) = params.dict_items {
+        if !items.is_empty() {
+            let all_comments = params.comment_ranges.comments_in_range(dict_range);
+            if !all_comments.is_empty() {
+                // Build per-field comments: trailing end-of-line, leading own-line, trailing own-line
+                let mut trailing: Vec<Option<&str>> = items.iter().map(|_| None).collect();
+                let mut leading: Vec<Vec<&str>> = items.iter().map(|_| Vec::new()).collect();
+                let mut trailing_own_line: Vec<Vec<&str>> =
+                    items.iter().map(|_| Vec::new()).collect();
+
+                for comment_range in all_comments {
+                    let start = comment_range.start();
+                    let line_start = params.source.line_start(start);
+                    let text = &params.source[*comment_range];
+
+                    // Trailing: same line as a field's value end
+                    let mut found = false;
+                    for (i, item) in items.iter().enumerate() {
+                        if line_start <= item.value.end() && start >= item.value.end() {
+                            if trailing[i].is_none() {
+                                trailing[i] = Some(text);
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if !found {
+                        // Leading: before some field's start
+                        let mut assigned = false;
+                        for (i, item) in items.iter().enumerate() {
+                            if start < item.start() {
+                                leading[i].push(text);
+                                assigned = true;
+                                break;
+                            }
+                        }
+                        // Trailing own-line: after last field
+                        if !assigned {
+                            let last = items.len() - 1;
+                            if start > items[last].value.end() {
+                                trailing_own_line[last].push(text);
+                            }
+                        }
+                    }
+                }
+
+                // Apply comments to output
+                let lines: Vec<String> = output.lines().map(String::from).collect();
+                let mut new_lines = Vec::with_capacity(lines.len());
+                let mut field_idx = 0;
+
+                for line in &lines {
+                    let trimmed = line.trim();
+                    if trimmed.contains(": ")
+                        && !trimmed.starts_with("class ")
+                        && !trimmed.starts_with("pass")
+                    {
+                        if field_idx < items.len() {
+                            let indent = line.len() - line.trim_start().len();
+                            let indent_str = " ".repeat(indent);
+
+                            for c in &leading[field_idx] {
+                                new_lines.push(format!("{indent_str}{c}"));
+                            }
+
+                            new_lines.push(line.clone());
+
+                            if let Some(c) = trailing[field_idx] {
+                                let last = new_lines.last_mut().unwrap();
+                                if !last.ends_with(' ') {
+                                    last.push(' ');
+                                }
+                                last.push_str(c);
+                            }
+
+                            for c in &trailing_own_line[field_idx] {
+                                new_lines.push(format!("{indent_str}{c}"));
+                            }
+
+                            field_idx += 1;
+                        }
+                    } else {
+                        new_lines.push(line.clone());
+                    }
+                }
+
+                output = new_lines.join("\n");
+            }
+        }
+    }
+
     Fix::applicable_edit(
-        Edit::range_replacement(
-            generator.stmt(&create_class_def_stmt(
-                class_name,
-                body,
-                total_keyword,
-                base_class,
-            )),
-            stmt.range(),
-        ),
-        if comment_ranges.intersects(stmt.range()) {
-            Applicability::Unsafe
-        } else {
-            Applicability::Safe
-        },
+        Edit::range_replacement(output, params.stmt.range()),
+        applicability,
     )
 }
