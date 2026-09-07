@@ -687,6 +687,33 @@ def _(obj: SpecificReader | Unrelated):
         reveal_type(obj)  # revealed: Unrelated
 ```
 
+Conversely, narrowing a gradual implementation with a fully static protocol retains the
+intersection. `GradualReader.read` can return any type, but `IntReader.read` restricts the return
+type to `int`, so the narrowed return type is `Any & int`:
+
+```py
+@runtime_checkable
+class IntReader(Protocol):
+    def read(self) -> int: ...
+
+class GradualReader:
+    def read(self) -> Any:
+        raise NotImplementedError
+
+def is_int_reader(x: object) -> TypeIs[IntReader]:
+    raise NotImplementedError
+
+def _(obj: GradualReader):
+    if is_int_reader(obj):
+        reveal_type(obj)  # revealed: GradualReader & IntReader
+        reveal_type(obj.read())  # revealed: Any & int
+
+    # For comparison, `isinstance` narrowing behaves in the same way:
+    if isinstance(obj, IntReader):
+        reveal_type(obj)  # revealed: GradualReader & IntReader
+        reveal_type(obj.read())  # revealed: Any & int
+```
+
 ### Strict mode
 
 ```toml
@@ -876,6 +903,32 @@ def _(obj: SpecificReader | Unrelated):
         reveal_type(obj.read())  # revealed: str
     else:
         reveal_type(obj)  # revealed: Unrelated
+```
+
+Narrowing a gradual implementation with a fully static protocol retains the same intersection as in
+non-strict mode, since materialization does not change the protocol:
+
+```py
+@runtime_checkable
+class IntReader(Protocol):
+    def read(self) -> int: ...
+
+class GradualReader:
+    def read(self) -> Any:
+        raise NotImplementedError
+
+def is_int_reader(x: object) -> TypeIs[IntReader]:
+    raise NotImplementedError
+
+def _(obj: GradualReader):
+    if is_int_reader(obj):
+        reveal_type(obj)  # revealed: GradualReader & IntReader
+        reveal_type(obj.read())  # revealed: Any & int
+
+    # For comparison, `isinstance` narrowing behaves in the same way:
+    if isinstance(obj, IntReader):
+        reveal_type(obj)  # revealed: GradualReader & IntReader
+        reveal_type(obj.read())  # revealed: Any & int
 ```
 
 ## `TypeIs` narrowing of `NewType` instances
